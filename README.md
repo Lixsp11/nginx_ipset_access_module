@@ -6,14 +6,17 @@ Changes to ipset membership take effect immediately — no NGINX reload required
 
 ## Background
 
-This module is based on the original [nginx_ipset_access_module](https://github.com/mehdi-roozitalab/nginx_ipset_access_module) by Mohammad Mahdi Roozitalab. The original module had several issues that prevented it from working correctly on modern systems. This fork rewrites the module with the following fixes and enhancements:
+This project is built upon [nginx_ipset_access_module](https://github.com/mehdi-roozitalab/nginx_ipset_access_module) by Mohammad Mahdi Roozitalab. The original project has not been maintained for several years, so we created this fork to provide a working, up-to-date implementation for modern NGINX and ipset versions.
 
-- **Fixed whitelist logic** — the original code had the whitelist condition inverted: IPs that *were* in the whitelist got denied, while IPs *not* in the whitelist were allowed through.
-- **Fixed `#include` order** — NGINX headers must come before libipset headers so that `_GNU_SOURCE` is defined, which is required for `struct in6_pktinfo` on modern glibc.
-- **Fixed handler phase** — moved from `NGX_HTTP_PREACCESS_PHASE` to `NGX_HTTP_ACCESS_PHASE` so the handler runs at the correct point in the request lifecycle.
-- **Added `ipset_status` directive** — configurable HTTP status code for denied requests (default `403`). Use `444` to silently drop the connection.
-- **Added `CAP_NET_ADMIN` retention** — the module automatically preserves `CAP_NET_ADMIN` across the master→worker privilege drop via `prctl(PR_SET_KEEPCAPS)` + POSIX capabilities, so worker processes can query ipsets without running as root.
-- **Fail-closed / fail-open** — when an ipset session cannot be created, whitelist mode denies the request (fail-closed) while blacklist mode allows it (fail-open).
+## Features
+
+- **Blacklist / Whitelist modes** — block or allow IPs based on ipset membership.
+- **Live updates** — ipset changes take effect immediately without reloading NGINX.
+- **Configurable deny status** (`ipset_status` directive) — return `403`, `404`, `444` (silent drop), or any HTTP status code.
+- **Non-root worker support** — automatically retains `CAP_NET_ADMIN` across the master→worker privilege drop via `prctl(PR_SET_KEEPCAPS)` + POSIX capabilities, so worker processes can query ipsets without running as root.
+- **Fail-safe behavior** — whitelist mode is fail-closed (deny on error); blacklist mode is fail-open (allow on error).
+- **Thread-local session caching** — ipset sessions are cached per worker to minimize overhead.
+- **Dynamic module support** — can be compiled as a `.so` and loaded into an existing NGINX installation without recompilation.
 
 ## Requirements
 
