@@ -9,19 +9,6 @@
  * without reloading NGINX.
  *
  * Based on the original nginx_ipset_access_module by mehdi-roozitalab.
- * Rewritten with the following fixes and enhancements:
- *
- *   - Fixed #include order so _GNU_SOURCE is defined before libipset
- *     headers (required for compilation on modern toolchains).
- *   - Fixed whitelist logic which was inverted in the original code
- *     (IPs IN the whitelist were denied instead of allowed).
- *   - Moved handler from NGX_HTTP_PREACCESS_PHASE to NGX_HTTP_ACCESS_PHASE
- *     so it runs at the correct point in the request lifecycle.
- *   - Added "ipset_status" directive for configurable HTTP deny status
- *     (default 403; supports 444 for silent connection drop, etc.).
- *   - Added automatic CAP_NET_ADMIN retention across the master->worker
- *     privilege drop so the module works with non-root worker processes.
- *   - Whitelist mode is fail-closed; blacklist mode is fail-open.
  */
 
 /* NGINX headers must come first — they define _GNU_SOURCE */
@@ -46,7 +33,8 @@
 #   define NGX_UNLIKELY(x)      (x)
 #endif
 
-#define NGX_IPSET_DEFAULT_STATUS  NGX_HTTP_FORBIDDEN
+#define NGX_IPSET_DEFAULT_STATUS    NGX_HTTP_FORBIDDEN
+#define NGX_IPSET_MAX_IP_LEN       46  /* max IPv6 text length */
 
 
 /* ------------------------------------------------------------------ */
@@ -175,8 +163,9 @@ typedef struct {
         e_mode_blacklist,
         e_mode_whitelist
     }             mode;
-    ngx_array_t   sets;         /* array of ngx_str_t (ipset names)    */
-    ngx_int_t     deny_status;  /* HTTP status to return when denying  */
+    ngx_array_t   sets;             /* array of ngx_str_t (ipset names)   */
+    ngx_int_t     deny_status;      /* HTTP status to return when denying */
+    ngx_str_t     real_ip_header;   /* header name for real client IP     */
 } ngx_ipset_access_srv_conf_t;
 
 
@@ -271,6 +260,8 @@ ngx_ipset_access_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_value(conf->deny_status, prev->deny_status,
                          NGX_IPSET_DEFAULT_STATUS);
 
+    ngx_conf_merge_str_value(conf->real_ip_header, prev->real_ip_header, "");
+
     return NGX_OK;
 }
 
@@ -354,6 +345,13 @@ static ngx_command_t ngx_ipset_access_commands[] = {
       ngx_conf_set_num_slot,
       NGX_HTTP_SRV_CONF_OFFSET,
       offsetof(ngx_ipset_access_srv_conf_t, deny_status),
+      NULL },
+
+    { ngx_string("ipset_real_ip_header"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_SRV_CONF_OFFSET,
+      offsetof(ngx_ipset_access_srv_conf_t, real_ip_header),
       NULL },
 
     ngx_null_command
@@ -466,6 +464,107 @@ ngx_module_t ngx_http_ipset_access = {
 
 
 /* ------------------------------------------------------------------ */
+/*  Real IP extraction from request headers                            */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Extract the client IP string to use for ipset testing.
+ *
+ * If ipset_real_ip_header is configured, look up that header in the
+ * request.  For X-Forwarded-For style headers (comma-separated list),
+ * the first (leftmost) IP is used — this is the original client IP
+ * appended by the first proxy in the chain.
+ *
+ * Returns a null-terminated IP string in the provided buffer,
+ * or NULL on failure.
+ */
+static char *
+ngx_ipset_extract_ip(ngx_http_request_t *r,
+    ngx_ipset_access_srv_conf_t *conf, char *buf, size_t buflen)
+{
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *header;
+    ngx_uint_t        i;
+    u_char           *p, *end;
+    size_t            len;
+
+    /* if no header configured, fall back to connection IP */
+    if (conf->real_ip_header.len == 0) {
+        goto use_sockaddr;
+    }
+
+    /* search request headers for the configured header name */
+    part = &r->headers_in.headers.part;
+    header = part->elts;
+
+    for (i = 0; /* void */; i++) {
+
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            header = part->elts;
+            i = 0;
+        }
+
+        if (header[i].key.len != conf->real_ip_header.len) {
+            continue;
+        }
+
+        if (ngx_strncasecmp(header[i].key.data, conf->real_ip_header.data,
+                            conf->real_ip_header.len) != 0)
+        {
+            continue;
+        }
+
+        /* found the header — extract the first IP from its value */
+        p = header[i].value.data;
+        end = p + header[i].value.len;
+
+        /* skip leading whitespace */
+        while (p < end && (*p == ' ' || *p == '\t')) {
+            p++;
+        }
+
+        /* find the end of the first IP (delimited by comma or whitespace) */
+        len = 0;
+        while (p + len < end
+               && p[len] != ','
+               && p[len] != ' '
+               && p[len] != '\t')
+        {
+            len++;
+        }
+
+        if (len == 0 || len >= buflen) {
+            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                          "ipset_access: invalid IP in header \"%V\"",
+                          &conf->real_ip_header);
+            goto use_sockaddr;
+        }
+
+        ngx_memcpy(buf, p, len);
+        buf[len] = '\0';
+        return buf;
+    }
+
+    /* header not found, fall back */
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "ipset_access: header \"%V\" not found, using connection IP",
+                   &conf->real_ip_header);
+
+use_sockaddr:
+
+    if (r->connection->sockaddr->sa_family != AF_INET) {
+        return NULL;
+    }
+
+    return inet_ntoa(((struct sockaddr_in *) r->connection->sockaddr)->sin_addr);
+}
+
+
+/* ------------------------------------------------------------------ */
 /*  Access-phase handler                                               */
 /* ------------------------------------------------------------------ */
 
@@ -478,6 +577,7 @@ ngx_ipset_access_handler(ngx_http_request_t *r)
     ngx_uint_t                    i;
     ngx_str_t                    *set;
     char                         *ip;
+    char                          ip_buf[NGX_IPSET_MAX_IP_LEN + 1];
 
     conf = ngx_http_get_module_srv_conf(r, ngx_http_ipset_access);
 
@@ -486,12 +586,11 @@ ngx_ipset_access_handler(ngx_http_request_t *r)
         return NGX_DECLINED;
     }
 
-    /* IPv4 only */
-    if (r->connection->sockaddr->sa_family != AF_INET) {
+    ip = ngx_ipset_extract_ip(r, conf, ip_buf, sizeof(ip_buf));
+    if (ip == NULL) {
+        /* non-IPv4 connection with no header override — skip */
         return NGX_DECLINED;
     }
-
-    ip = inet_ntoa(((struct sockaddr_in *) r->connection->sockaddr)->sin_addr);
 
     session = ngx_ipset_get_session();
     if (session == NULL) {

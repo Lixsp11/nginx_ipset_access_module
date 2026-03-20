@@ -15,6 +15,7 @@ This project is built upon [nginx_ipset_access_module](https://github.com/mehdi-
 - **Configurable deny status** (`ipset_status` directive) — return `403`, `404`, `444` (silent drop), or any HTTP status code.
 - **Non-root worker support** — automatically retains `CAP_NET_ADMIN` across the master→worker privilege drop via `prctl(PR_SET_KEEPCAPS)` + POSIX capabilities, so worker processes can query ipsets without running as root.
 - **Fail-safe behavior** — whitelist mode is fail-closed (deny on error); blacklist mode is fail-open (allow on error).
+- **CDN / reverse proxy support** (`ipset_real_ip_header` directive) — read the real client IP from headers like `X-Forwarded-For`, `CF-Connecting-IP`, `X-Real-IP`, etc.
 - **Thread-local session caching** — ipset sessions are cached per worker to minimize overhead.
 - **Dynamic module support** — can be compiled as a `.so` and loaded into an existing NGINX installation without recompilation.
 
@@ -114,6 +115,27 @@ HTTP status code returned to denied clients. Common values:
 | `404` | Not Found (stealth) |
 | `444` | Close connection with no response (NGINX special) |
 
+#### `ipset_real_ip_header`
+
+- **Syntax:** `ipset_real_ip_header <header_name>`
+- **Default:** *not set* (use connection IP)
+- **Context:** `http`, `server`
+
+Specifies an HTTP request header from which to read the real client IP address. This is essential when NGINX is behind a CDN or reverse proxy, where the connection IP is the proxy's address rather than the actual client.
+
+For headers containing multiple IPs (like `X-Forwarded-For: client, proxy1, proxy2`), the **first** (leftmost) IP is used.
+
+If the header is not present in a request, the module falls back to the connection IP.
+
+Common values:
+
+| Header | Used by |
+|--------|---------|
+| `X-Forwarded-For` | Most CDNs and reverse proxies |
+| `X-Real-IP` | NGINX reverse proxy |
+| `CF-Connecting-IP` | Cloudflare |
+| `True-Client-IP` | Akamai, Cloudflare (Enterprise) |
+
 ### Example
 
 ```nginx
@@ -126,6 +148,9 @@ http {
         # Only allow IPs in the "trusted" ipset
         whitelist trusted;
         ipset_status 444;
+
+        # Behind Cloudflare — read real client IP from header
+        ipset_real_ip_header CF-Connecting-IP;
 
         location / {
             root /var/www/html;
@@ -178,7 +203,7 @@ Changes to ipset membership are reflected immediately in NGINX without any reloa
 
 ## Limitations
 
-- **IPv4 only** — IPv6 connections are passed through without checking.
+- **IPv4 only** — IPv6 connections are passed through without checking (unless an IPv4 address is provided via `ipset_real_ip_header`).
 - **`return` directive** — NGINX's `return` directive executes in the rewrite phase (before the access phase), so it bypasses this module. Use `root`, `proxy_pass`, or other content-phase directives instead.
 - **libipset v6 vs v7** — The module supports both versions. Compile with `-DWITH_LIBIPSET_V6_COMPAT` if using libipset v6.
 
