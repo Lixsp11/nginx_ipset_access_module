@@ -181,4 +181,4 @@ Changes to ipset membership are reflected immediately in NGINX without any reloa
 
 ## License
 
-BSD 2-Clause. See [LICENSE](LICENSE).
+LGPL-3.0. See [LICENSE](LICENSE).
