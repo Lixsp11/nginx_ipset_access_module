@@ -43,15 +43,15 @@ jobs:
       - name: Prepare artifact
         run: |
           cd nginx-${{ matrix.nginx_version }}
-          ARTIFACT_NAME="ngx_http_ipset_access-nginx-${{ matrix.nginx_version }}-linux-amd64.so"
-          cp objs/ngx_http_ipset_access.so "${ARTIFACT_NAME}"
+          ARTIFACT_NAME="ngx_http_ipset_access_module-nginx-${{ matrix.nginx_version }}-linux-amd64.so"
+          cp objs/ngx_http_ipset_access_module.so "${ARTIFACT_NAME}"
           sha256sum "${ARTIFACT_NAME}" > "${ARTIFACT_NAME}.sha256"
           echo "ARTIFACT_NAME=${ARTIFACT_NAME}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ngx_http_ipset_access-nginx-${{ matrix.nginx_version }}
+          name: ngx_http_ipset_access_module-nginx-${{ matrix.nginx_version }}
           path: |
             nginx-${{ matrix.nginx_version }}/${{ env.ARTIFACT_NAME }}
             nginx-${{ matrix.nginx_version }}/${{ env.ARTIFACT_NAME }}.sha256

@@ -1,4 +1,4 @@
-# ngx_http_ipset_access
+# ngx_http_ipset_access_module
 
 An NGINX module that uses Linux kernel [ipset](https://ipset.netfilter.org/) sets for IP-based access control (blacklist / whitelist).
 
@@ -6,7 +6,7 @@ Changes to ipset membership take effect immediately — no NGINX reload required
 
 ## Background
 
-This project is built upon [nginx_ipset_access_module](https://github.com/mehdi-roozitalab/nginx_ipset_access_module) by Mohammad Mahdi Roozitalab. The original project has not been maintained for several years, so we created this fork to provide a working, up-to-date implementation for modern NGINX and ipset versions.
+This project is built upon [ngx_http_ipset_access_module](https://github.com/mehdi-roozitalab/ngx_http_ipset_access_module) by Mohammad Mahdi Roozitalab. The original project has not been maintained for several years, so we created this fork to provide a working, up-to-date implementation for modern NGINX and ipset versions.
 
 ## Features
 
@@ -57,20 +57,20 @@ cd nginx-${NGINX_VERSION}
 # Configure with the same flags as your system NGINX, plus --with-compat
 # You can find the original flags with: nginx -V
 ./configure --with-compat \
-    --add-dynamic-module=/path/to/ngx_http_ipset_access
+    --add-dynamic-module=/path/to/ngx_http_ipset_access_module
 
 # Build only the module
 make modules
 
 # Install
-cp objs/ngx_http_ipset_access.so /usr/lib/nginx/modules/
+cp objs/ngx_http_ipset_access_module.so /usr/lib/nginx/modules/
 ```
 
 ### As a static module
 
 ```bash
 cd nginx-${NGINX_VERSION}
-./configure --add-module=/path/to/ngx_http_ipset_access [other flags...]
+./configure --add-module=/path/to/ngx_http_ipset_access_module [other flags...]
 make
 make install
 ```
@@ -82,7 +82,7 @@ make install
 Add to the top of `nginx.conf` (or in a file under `modules-enabled/`):
 
 ```nginx
-load_module modules/ngx_http_ipset_access.so;
+load_module modules/ngx_http_ipset_access_module.so;
 ```
 
 ### Directives
@@ -139,7 +139,7 @@ Common values:
 ### Example
 
 ```nginx
-load_module modules/ngx_http_ipset_access.so;
+load_module modules/ngx_http_ipset_access_module.so;
 
 http {
     server {

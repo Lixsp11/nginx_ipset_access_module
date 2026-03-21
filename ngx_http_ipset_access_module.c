@@ -447,7 +447,7 @@ static ngx_http_module_t ngx_ipset_access_module_ctx = {
     NULL                                     /* merge location configuration */
 };
 
-ngx_module_t ngx_http_ipset_access = {
+ngx_module_t ngx_http_ipset_access_module = {
     NGX_MODULE_V1,
     &ngx_ipset_access_module_ctx,            /* module context */
     ngx_ipset_access_commands,               /* module directives */
@@ -579,7 +579,7 @@ ngx_ipset_access_handler(ngx_http_request_t *r)
     char                         *ip;
     char                          ip_buf[NGX_IPSET_MAX_IP_LEN + 1];
 
-    conf = ngx_http_get_module_srv_conf(r, ngx_http_ipset_access);
+    conf = ngx_http_get_module_srv_conf(r, ngx_http_ipset_access_module);
 
     /* skip if not configured or explicitly disabled */
     if (conf->mode != e_mode_whitelist && conf->mode != e_mode_blacklist) {
