@@ -33,8 +33,11 @@
 #   define NGX_UNLIKELY(x)      (x)
 #endif
 
-#define NGX_IPSET_DEFAULT_STATUS    NGX_HTTP_FORBIDDEN
-#define NGX_IPSET_MAX_IP_LEN       46  /* max IPv6 text length */
+#define NGX_IPSET_DEFAULT_STATUS       NGX_HTTP_FORBIDDEN
+#define NGX_IPSET_MAX_IP_LEN           46   /* max IPv6 text length        */
+#define NGX_IPSET_CACHE_BUCKETS        1024 /* hash buckets, must be 2^n   */
+#define NGX_IPSET_CACHE_MAX_ENTRIES    10000
+#define NGX_IPSET_CACHE_KEY_MAX        64   /* IP + NUL + conf pointer     */
 
 
 /* ------------------------------------------------------------------ */
@@ -153,6 +156,173 @@ ngx_ipset_get_session(void)
 
 
 /* ------------------------------------------------------------------ */
+/*  Per-worker LRU cache for ipset query results                       */
+/*                                                                     */
+/*  Each worker maintains a hash table + doubly-linked LRU list.       */
+/*  Cache key = IP string + conf pointer (to distinguish different     */
+/*  server blocks).  Entries expire after the configured TTL.          */
+/*  Max entries capped to prevent unbounded memory growth; when full,  */
+/*  the least-recently-used entry is evicted.                          */
+/*  Uses malloc/free since NGINX pool lifetimes don't suit per-worker  */
+/*  caches.  No locking — NGINX workers are single-threaded.           */
+/* ------------------------------------------------------------------ */
+
+typedef struct ngx_ipset_cache_node_s  ngx_ipset_cache_node_t;
+
+struct ngx_ipset_cache_node_s {
+    ngx_ipset_cache_node_t  *hash_next;
+    ngx_ipset_cache_node_t  *lru_prev;
+    ngx_ipset_cache_node_t  *lru_next;
+    ngx_msec_t               expiry;
+    ngx_ipset_test_result_t  result;
+    uint32_t                 hash;
+    size_t                   key_len;
+    u_char                   key[NGX_IPSET_CACHE_KEY_MAX];
+};
+
+typedef struct {
+    ngx_ipset_cache_node_t  *buckets[NGX_IPSET_CACHE_BUCKETS];
+    ngx_ipset_cache_node_t   lru_head;   /* sentinel: next=MRU, prev=LRU */
+    ngx_uint_t               count;
+} ngx_ipset_cache_t;
+
+static ngx_ipset_cache_t  *ngx_ipset_cache;
+
+
+static void
+ngx_ipset_cache_lru_remove(ngx_ipset_cache_node_t *node)
+{
+    node->lru_prev->lru_next = node->lru_next;
+    node->lru_next->lru_prev = node->lru_prev;
+}
+
+static void
+ngx_ipset_cache_lru_push_front(ngx_ipset_cache_t *cache,
+    ngx_ipset_cache_node_t *node)
+{
+    node->lru_next = cache->lru_head.lru_next;
+    node->lru_prev = &cache->lru_head;
+    cache->lru_head.lru_next->lru_prev = node;
+    cache->lru_head.lru_next = node;
+}
+
+static void
+ngx_ipset_cache_remove_from_bucket(ngx_ipset_cache_t *cache,
+    ngx_ipset_cache_node_t *node)
+{
+    uint32_t                 idx;
+    ngx_ipset_cache_node_t **pp;
+
+    idx = node->hash & (NGX_IPSET_CACHE_BUCKETS - 1);
+    pp = &cache->buckets[idx];
+
+    while (*pp != NULL) {
+        if (*pp == node) {
+            *pp = node->hash_next;
+            return;
+        }
+        pp = &(*pp)->hash_next;
+    }
+}
+
+static void
+ngx_ipset_cache_evict_node(ngx_ipset_cache_t *cache,
+    ngx_ipset_cache_node_t *node)
+{
+    ngx_ipset_cache_lru_remove(node);
+    ngx_ipset_cache_remove_from_bucket(cache, node);
+    cache->count--;
+    free(node);
+}
+
+static ngx_ipset_cache_t *
+ngx_ipset_cache_create(void)
+{
+    ngx_ipset_cache_t *cache;
+
+    cache = calloc(1, sizeof(ngx_ipset_cache_t));
+    if (cache == NULL) {
+        return NULL;
+    }
+
+    cache->lru_head.lru_next = &cache->lru_head;
+    cache->lru_head.lru_prev = &cache->lru_head;
+
+    return cache;
+}
+
+static ngx_ipset_cache_node_t *
+ngx_ipset_cache_lookup(ngx_ipset_cache_t *cache,
+    const u_char *key, size_t key_len, uint32_t hash)
+{
+    uint32_t                 idx;
+    ngx_ipset_cache_node_t  *node, *next;
+
+    idx = hash & (NGX_IPSET_CACHE_BUCKETS - 1);
+
+    for (node = cache->buckets[idx]; node != NULL; node = next) {
+        next = node->hash_next;
+
+        if (node->hash == hash
+            && node->key_len == key_len
+            && ngx_memcmp(node->key, key, key_len) == 0)
+        {
+            if (ngx_current_msec <= node->expiry) {
+                /* cache hit — move to MRU */
+                ngx_ipset_cache_lru_remove(node);
+                ngx_ipset_cache_lru_push_front(cache, node);
+                return node;
+            }
+
+            /* expired — evict */
+            ngx_ipset_cache_evict_node(cache, node);
+            return NULL;
+        }
+    }
+
+    return NULL;
+}
+
+static void
+ngx_ipset_cache_insert(ngx_ipset_cache_t *cache,
+    const u_char *key, size_t key_len, uint32_t hash,
+    ngx_ipset_test_result_t result, ngx_msec_t ttl)
+{
+    uint32_t                idx;
+    ngx_ipset_cache_node_t *node;
+
+    /* evict LRU tail if at capacity */
+    while (cache->count >= NGX_IPSET_CACHE_MAX_ENTRIES) {
+        node = cache->lru_head.lru_prev;
+        if (node == &cache->lru_head) {
+            break;
+        }
+        ngx_ipset_cache_evict_node(cache, node);
+    }
+
+    node = malloc(sizeof(ngx_ipset_cache_node_t));
+    if (node == NULL) {
+        return;
+    }
+
+    node->hash = hash;
+    node->key_len = key_len;
+    ngx_memcpy(node->key, key, key_len);
+    node->result = result;
+    node->expiry = ngx_current_msec + ttl;
+
+    /* insert into hash bucket */
+    idx = hash & (NGX_IPSET_CACHE_BUCKETS - 1);
+    node->hash_next = cache->buckets[idx];
+    cache->buckets[idx] = node;
+
+    /* insert at MRU position */
+    ngx_ipset_cache_lru_push_front(cache, node);
+    cache->count++;
+}
+
+
+/* ------------------------------------------------------------------ */
 /*  Module configuration                                               */
 /* ------------------------------------------------------------------ */
 
@@ -166,6 +336,7 @@ typedef struct {
     ngx_array_t   sets;             /* array of ngx_str_t (ipset names)   */
     ngx_int_t     deny_status;      /* HTTP status to return when denying */
     ngx_str_t     real_ip_header;   /* header name for real client IP     */
+    ngx_msec_t    cache_ttl;        /* result cache TTL; 0 = disabled     */
 } ngx_ipset_access_srv_conf_t;
 
 
@@ -228,6 +399,7 @@ ngx_ipset_access_create_srv_conf(ngx_conf_t *cf)
     }
 
     conf->deny_status = NGX_CONF_UNSET;
+    conf->cache_ttl = NGX_CONF_UNSET_MSEC;
 
     if (ngx_array_init(&conf->sets, cf->pool, 0, sizeof(ngx_str_t))
         != NGX_OK)
@@ -261,6 +433,8 @@ ngx_ipset_access_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
                          NGX_IPSET_DEFAULT_STATUS);
 
     ngx_conf_merge_str_value(conf->real_ip_header, prev->real_ip_header, "");
+
+    ngx_conf_merge_msec_value(conf->cache_ttl, prev->cache_ttl, 0);
 
     return NGX_OK;
 }
@@ -354,6 +528,13 @@ static ngx_command_t ngx_ipset_access_commands[] = {
       offsetof(ngx_ipset_access_srv_conf_t, real_ip_header),
       NULL },
 
+    { ngx_string("ipset_cache_ttl"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_msec_slot,
+      NGX_HTTP_SRV_CONF_OFFSET,
+      offsetof(ngx_ipset_access_srv_conf_t, cache_ttl),
+      NULL },
+
     ngx_null_command
 };
 
@@ -378,16 +559,6 @@ ngx_ipset_access_postconfiguration(ngx_conf_t *cf)
 
 /* ------------------------------------------------------------------ */
 /*  CAP_NET_ADMIN handling for non-root workers                        */
-/*                                                                     */
-/*  init_module: runs in the master (root) before forking workers.     */
-/*  Sets PR_SET_KEEPCAPS so permitted capabilities survive the         */
-/*  upcoming setuid() to the unprivileged worker user.                 */
-/*                                                                     */
-/*  init_process: runs in each worker after fork + setuid.  The        */
-/*  effective capability set is empty at this point, but the           */
-/*  permitted set still contains CAP_NET_ADMIN thanks to keepcaps.    */
-/*  We raise it back into the effective set so libipset's netlink      */
-/*  operations succeed.                                                */
 /* ------------------------------------------------------------------ */
 
 static ngx_int_t
@@ -467,17 +638,6 @@ ngx_module_t ngx_http_ipset_access_module = {
 /*  Real IP extraction from request headers                            */
 /* ------------------------------------------------------------------ */
 
-/*
- * Extract the client IP string to use for ipset testing.
- *
- * If ipset_real_ip_header is configured, look up that header in the
- * request.  For X-Forwarded-For style headers (comma-separated list),
- * the first (leftmost) IP is used — this is the original client IP
- * appended by the first proxy in the chain.
- *
- * Returns a null-terminated IP string in the provided buffer,
- * or NULL on failure.
- */
 static char *
 ngx_ipset_extract_ip(ngx_http_request_t *r,
     ngx_ipset_access_srv_conf_t *conf, char *buf, size_t buflen)
@@ -488,12 +648,10 @@ ngx_ipset_extract_ip(ngx_http_request_t *r,
     u_char           *p, *end;
     size_t            len;
 
-    /* if no header configured, fall back to connection IP */
     if (conf->real_ip_header.len == 0) {
         goto use_sockaddr;
     }
 
-    /* search request headers for the configured header name */
     part = &r->headers_in.headers.part;
     header = part->elts;
 
@@ -518,16 +676,13 @@ ngx_ipset_extract_ip(ngx_http_request_t *r,
             continue;
         }
 
-        /* found the header — extract the first IP from its value */
         p = header[i].value.data;
         end = p + header[i].value.len;
 
-        /* skip leading whitespace */
         while (p < end && (*p == ' ' || *p == '\t')) {
             p++;
         }
 
-        /* find the end of the first IP (delimited by comma or whitespace) */
         len = 0;
         while (p + len < end
                && p[len] != ','
@@ -549,7 +704,6 @@ ngx_ipset_extract_ip(ngx_http_request_t *r,
         return buf;
     }
 
-    /* header not found, fall back */
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "ipset_access: header \"%V\" not found, using connection IP",
                    &conf->real_ip_header);
@@ -578,6 +732,11 @@ ngx_ipset_access_handler(ngx_http_request_t *r)
     ngx_str_t                    *set;
     char                         *ip;
     char                          ip_buf[NGX_IPSET_MAX_IP_LEN + 1];
+    u_char                        cache_key[NGX_IPSET_CACHE_KEY_MAX];
+    size_t                        cache_key_len;
+    uint32_t                      cache_hash = 0;
+    size_t                        ip_len;
+    ngx_ipset_cache_node_t       *cnode;
 
     conf = ngx_http_get_module_srv_conf(r, ngx_http_ipset_access_module);
 
@@ -588,16 +747,45 @@ ngx_ipset_access_handler(ngx_http_request_t *r)
 
     ip = ngx_ipset_extract_ip(r, conf, ip_buf, sizeof(ip_buf));
     if (ip == NULL) {
-        /* non-IPv4 connection with no header override — skip */
         return NGX_DECLINED;
     }
+
+    /* --- cache lookup --- */
+    cache_key_len = 0;
+
+    if (conf->cache_ttl > 0) {
+        if (ngx_ipset_cache == NULL) {
+            ngx_ipset_cache = ngx_ipset_cache_create();
+        }
+
+        if (ngx_ipset_cache != NULL) {
+            ip_len = ngx_strlen(ip);
+
+            /* build cache key: IP + NUL + conf pointer */
+            if (ip_len + 1 + sizeof(void *) <= NGX_IPSET_CACHE_KEY_MAX) {
+                ngx_memcpy(cache_key, ip, ip_len + 1);
+                ngx_memcpy(cache_key + ip_len + 1, &conf, sizeof(void *));
+                cache_key_len = ip_len + 1 + sizeof(void *);
+                cache_hash = ngx_murmur_hash2(cache_key, cache_key_len);
+
+                cnode = ngx_ipset_cache_lookup(ngx_ipset_cache,
+                                               cache_key, cache_key_len,
+                                               cache_hash);
+                if (cnode != NULL) {
+                    result = cnode->result;
+                    goto decide;
+                }
+            }
+        }
+    }
+
+    /* --- ipset query --- */
 
     session = ngx_ipset_get_session();
     if (session == NULL) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                       "ipset_access: cannot create session for \"%s\"", ip);
 
-        /* fail-closed for whitelist, fail-open for blacklist */
         if (conf->mode == e_mode_whitelist) {
             return conf->deny_status;
         }
@@ -621,6 +809,17 @@ ngx_ipset_access_handler(ngx_http_request_t *r)
             break;
         }
     }
+
+    /* --- cache insert (only cache definitive results) --- */
+    if (cache_key_len > 0
+        && (result == IPS_TEST_IS_IN_SET || result == IPS_TEST_IS_NOT_IN_SET))
+    {
+        ngx_ipset_cache_insert(ngx_ipset_cache,
+                               cache_key, cache_key_len, cache_hash,
+                               result, conf->cache_ttl);
+    }
+
+decide:
 
     /*
      * Whitelist: deny if the IP is NOT in any configured set.

@@ -16,6 +16,7 @@ This project is built upon [ngx_http_ipset_access_module](https://github.com/meh
 - **Non-root worker support** — automatically retains `CAP_NET_ADMIN` across the master→worker privilege drop via `prctl(PR_SET_KEEPCAPS)` + POSIX capabilities, so worker processes can query ipsets without running as root.
 - **Fail-safe behavior** — whitelist mode is fail-closed (deny on error); blacklist mode is fail-open (allow on error).
 - **CDN / reverse proxy support** (`ipset_real_ip_header` directive) — read the real client IP from headers like `X-Forwarded-For`, `CF-Connecting-IP`, `X-Real-IP`, etc.
+- **Query result caching** (`ipset_cache_ttl` directive) — per-worker LRU cache avoids redundant kernel queries. Configurable TTL (e.g. `30s`); max 10,000 entries per worker with automatic eviction.
 - **Thread-local session caching** — ipset sessions are cached per worker to minimize overhead.
 - **Dynamic module support** — can be compiled as a `.so` and loaded into an existing NGINX installation without recompilation.
 
@@ -135,6 +136,21 @@ Common values:
 | `X-Real-IP` | NGINX reverse proxy |
 | `CF-Connecting-IP` | Cloudflare |
 | `True-Client-IP` | Akamai, Cloudflare (Enterprise) |
+
+#### `ipset_cache_ttl`
+
+- **Syntax:** `ipset_cache_ttl <time>`
+- **Default:** `0` (disabled)
+- **Context:** `http`, `server`
+
+Caches ipset query results per worker process. When enabled, repeated requests from the same IP skip the kernel ipset query and use the cached result until the TTL expires.
+
+Trade-off: reduces CPU/kernel overhead at high QPS, but ipset changes are delayed by up to the TTL duration. The cache holds up to 10,000 entries per worker with LRU eviction.
+
+```nginx
+ipset_cache_ttl 30s;   # cache results for 30 seconds
+ipset_cache_ttl 0;     # disable (default, every request queries ipset)
+```
 
 ### Example
 
